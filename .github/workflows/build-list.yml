@@ -1,0 +1,150 @@
+name: Build Adblock Lists
+
+on:
+  push:
+    paths:
+      - "list.md"
+  schedule:
+    - cron: "44 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl gawk
+
+      - name: Get current date
+        id: date
+        run: |
+          echo "display=$(date +'%Y-%m-%d %H:%M')" >> "$GITHUB_OUTPUT"
+
+      - name: Parse list.md, compile and generate compatibility outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p lists
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+
+          block_src="$workdir/block_sources.txt"
+          allow_src="$workdir/allow_sources.txt"
+          block_raw="$workdir/block_raw.txt"
+          allow_raw="$workdir/allow_raw.txt"
+
+          touch "$block_src" "$allow_src" "$block_raw" "$allow_raw"
+
+          if [ ! -f "list.md" ]; then
+            echo "Errore: list.md non esiste"
+            exit 1
+          fi
+
+          sed 's/\r$//' list.md > "$workdir/list.normalized.md"
+
+          awk -v bsrc="$block_src" -v asrc="$allow_src" '
+            BEGIN { mode="" }
+
+            # Cerca blocklist: ignorando eventuali # o spazi prima
+            /^[[:space:]]*(#+)?[[:space:]]*blocklist:[[:space:]]*$/ {
+              mode="block"
+              next
+            }
+
+            # Cerca allowlist: ignorando eventuali # o spazi prima
+            /^[[:space:]]*(#+)?[[:space:]]*allowlist:[[:space:]]*$/ {
+              mode="allow"
+              next
+            }
+
+            # Ignora righe vuote o commenti markdown normali (singolo #)
+            /^[[:space:]]*$/ || /^[[:space:]]*#[^#]/ {
+              next
+            }
+
+            mode != "" {
+              line = $0
+
+              # Se è una checkbox attiva: "- [x] list:URL" oppure "- [x] dominio" oppure "- [x] ?param=val"
+              if (line ~ /^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]+/) {
+                sub(/^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+
+                # Rimuovi eventuali backtick che racchiudono la regola
+                sub(/^`/, "", line)
+                sub(/`$/, "", line)
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+
+                if (length(line) > 0) {
+                  if (mode == "block") {
+                    print line >> bsrc
+                  } else if (mode == "allow") {
+                    print line >> asrc
+                  }
+                }
+              }
+            }
+          ' "$workdir/list.normalized.md"
+
+          echo "=== DEBUG block sources ==="
+          cat "$block_src" || true
+          echo "=== DEBUG allow sources ==="
+          cat "$allow_src" || true
+
+          block_count="$(wc -l < "$block_src" | tr -d ' ')"
+          allow_count="$(wc -l < "$allow_src" | tr -d ' ')"
+
+          echo "Block sources: $block_count"
+          echo "Allow sources: $allow_count"
+
+          if [ "$block_count" -eq 0 ] && [ "$allow_count" -eq 0 ]; then
+            echo "Errore: nessuna voce [x] trovata in list.md"
+            exit 1
+          fi
+
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            if [[ "$line" == list:* ]]; then
+              url="${line#list:}"
+              echo "Downloading block: $url"
+              curl -fsSL --connect-timeout 15 --retry 3 "$url" >> "$block_raw" || echo "! failed to download $url" >> "$block_raw"
+              printf '\n' >> "$block_raw"
+            else
+              echo "$line" >> "$block_raw"
+            fi
+          done < "$block_src"
+
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            if [[ "$line" == list:* ]]; then
+              url="${line#list:}"
+              echo "Downloading allow: $url"
+              curl -fsSL --connect-timeout 15 --retry 3 "$url" >> "$allow_raw" || echo "! failed to download $url" >> "$allow_raw"
+              printf '\n' >> "$allow_raw"
+            else
+              echo "$line" >> "$allow_raw"
+            fi
+          done < "$allow_src"
+
+          python3 scripts/assemble_lists.py --workdir "$workdir" --output-dir lists
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add lists/*.txt
+          git commit -m "Aggiornamento liste automatico: ${{ steps.date.outputs.display }}" || echo "Nessuna modifica da committare"
+          git push
